@@ -94,8 +94,8 @@ public:
   {
     rmw_qos_profile_t custom_qos_profile = rmw_qos_profile_sensor_data;
     custom_qos_profile.depth = queue_size;
-    const std::string & ros1_type_name = ros1_type_name_;
-    const std::string & ros2_type_name = ros2_type_name_;
+    const std::string& ros1_type_name = ros1_type_name_;
+    const std::string& ros2_type_name = ros2_type_name_;
     // TODO(wjwwood): use a lambda until create_subscription supports std/boost::bind.
     auto callback =
       [this, ros1_pub, ros1_type_name, ros2_type_name,
@@ -126,29 +126,27 @@ protected:
     const boost::shared_ptr<ros::M_string> & connection_header =
       ros1_msg_event.getConnectionHeaderPtr();
     if (!connection_header) {
-      printf("  dropping message without connection header\n");
+      RCUTILS_LOG_ERROR("Dropping message without connection header\n");
       return;
     }
 
     const auto caller = connection_header->find("callerid");
-    const auto node_name = ros::this_node::getName();
+    const std::string& node_name = ros::this_node::getName();
     if (caller != connection_header->end()) {
       if (caller->second == node_name) {
         return;
       }
     }
 
-    const boost::shared_ptr<ROS1_T const> & ros1_msg = ros1_msg_event.getConstMessage();
-
     auto ros2_msg = std::make_shared<ROS2_T>();
     try {
-      convert_1_to_2(*ros1_msg, *ros2_msg);
+      convert_1_to_2(*ros1_msg_event.getConstMessage(), *ros2_msg);
       typed_ros2_pub->publish(ros2_msg);
       RCUTILS_LOG_INFO_ONCE_NAMED(
               node_name.c_str(),
               "Passing message from ROS 1 %s to ROS 2 %s (showing msg only once per type)",
               ros1_type_name.c_str(), ros2_type_name.c_str());
-    } catch (std::runtime_error &e) {
+    } catch (const std::runtime_error &e) {
       RCUTILS_LOG_ERROR("Error converting ROS1=>ROS2 msg. Caller: %s ;Node: %s ;ROS1_Type: %s ;ROS2_Type: %s \nError: %s",
       caller, node_name, ros1_type_name, ros2_type_name, e.what());
     }
@@ -178,7 +176,7 @@ protected:
     }
 
     ROS1_T ros1_msg;
-    const auto node_name = ros::this_node::getName();
+    const std::string& node_name = ros::this_node::getName();
     try {
       convert_2_to_1(*ros2_msg, ros1_msg);
       RCUTILS_LOG_INFO_ONCE_NAMED(
@@ -186,7 +184,7 @@ protected:
               "Passing message from ROS 2 %s to ROS 1 %s (showing msg only once per type)",
               ros1_type_name.c_str(), ros2_type_name.c_str());
       ros1_pub.publish(ros1_msg);
-    } catch (std::runtime_error &e) {
+    } catch (const std::runtime_error &e) {
       RCUTILS_LOG_ERROR("Error converting ROS2=>ROS1 msg. Node: %s ;ROS2_Type: %s ;ROS1_Type: %s \nError: %s",
                          node_name, ros2_type_name, ros1_type_name, e.what());
     }
@@ -238,14 +236,14 @@ public:
   {
     auto client = std::dynamic_pointer_cast<rclcpp::Client<ROS2_T>>(cli);
     if (!client) {
-      fprintf(stderr, "Failed to get the client.\n");
+      RCUTILS_LOG_ERROR("Failed to get the client.\n");
       return false;
     }
     auto request2 = std::make_shared<ROS2Request>();
     translate_1_to_2(request1, *request2);
     while (!client->wait_for_service(std::chrono::seconds(1))) {
       if (!rclcpp::ok()) {
-        fprintf(stderr, "Client was interrupted while waiting for the service. Exiting.\n");
+        RCUTILS_LOG_ERROR("Client was interrupted while waiting for the service. Exiting.\n");
         return false;
       }
     }
