@@ -18,6 +18,7 @@ find_package(rmw_implementation_cmake REQUIRED)
 find_package(std_msgs REQUIRED)
 
 # find ROS 1 packages
+set(cmake_extras_files cmake/find_ros1_package.cmake cmake/find_ros1_interface_packages.cmake)
 include(cmake/find_ros1_package.cmake)
 
 find_package(PkgConfig)
@@ -32,7 +33,9 @@ find_ros1_package(roscpp)
 if(NOT ros1_roscpp_FOUND)
   message(WARNING "Failed to find ROS 1 roscpp, skipping...")
   # call ament_package() to avoid ament_tools treating this as a plain CMake pkg
-  ament_package()
+  ament_package(
+    CONFIG_EXTRAS ${cmake_extras_files}
+  )
   return()
 endif()
 
@@ -44,8 +47,12 @@ find_ros1_interface_packages(ros1_message_packages)
 
 set(prefixed_ros1_message_packages "")
 foreach(ros1_message_package ${ros1_message_packages})
-  find_ros1_package(${ros1_message_package} REQUIRED)
-  list(APPEND prefixed_ros1_message_packages "ros1_${ros1_message_package}")
+  # TODO(karsten1987): This is currently a workaround to work with ROS 2 classloader
+  # rather than ROS 1 classloader.
+  if(NOT "${ros1_message_package}" STREQUAL "nodelet")
+    find_ros1_package(${ros1_message_package} REQUIRED)
+    list(APPEND prefixed_ros1_message_packages "ros1_${ros1_message_package}")
+  endif()
 endforeach()
 
 set(TEST_ROS1_BRIDGE FALSE)
@@ -56,6 +63,14 @@ if(BUILD_TESTING)
   find_ros1_package(roslaunch)
   ament_lint_auto_find_test_dependencies()
   if(ros1_diagnostic_msgs_FOUND AND ros1_roslaunch_FOUND)
+    # ensure that the ROS 2 diagnostic_msgs was found by find_package
+    # and not the ROS 1 package
+    set(_ros1_diagnostic_msgs_DIR "${ros1_diagnostic_msgs_PREFIX}/share/diagnostic_msgs/cmake")
+    if("${diagnostic_msgs_DIR}" STREQUAL "${_ros1_diagnostic_msgs_DIR}")
+      # invalidate the cached result to retry finding the package next time
+      unset(diagnostic_msgs_DIR CACHE)
+      message(FATAL_ERROR "Failed to find ROS 2 package 'diagnostic_msgs'")
+    endif()
     set(TEST_ROS1_BRIDGE TRUE)
   endif()
 endif()
@@ -65,7 +80,9 @@ ament_export_libraries(${PROJECT_NAME})
 
 ament_python_install_package(${PROJECT_NAME})
 
-ament_package()
+ament_package(
+  CONFIG_EXTRAS ${cmake_extras_files}
+)
 
 set(generated_path "${CMAKE_BINARY_DIR}/generated")
 set(generated_files "${generated_path}/get_factory.cpp")
@@ -131,6 +148,7 @@ custom_executable(simple_bridge "src/simple_bridge.cpp"
 add_library(${PROJECT_NAME} SHARED
   "src/builtin_interfaces_factories.cpp"
   "src/convert_builtin_interfaces.cpp"
+  "src/bridge.cpp"
   ${generated_files})
 ament_target_dependencies(${PROJECT_NAME}
   ${prefixed_ros1_message_packages}
