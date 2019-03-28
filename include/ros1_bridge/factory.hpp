@@ -167,14 +167,12 @@ protected:
     }
 
     const auto caller = connection_header->find("callerid");
-    const auto node_name = ros::this_node::getName();
+    const std::string& node_name = ros::this_node::getName();
     if (caller != connection_header->end()) {
       if (caller->second == node_name) {
         return;
       }
     }
-
-    const boost::shared_ptr<ROS1_T const> & ros1_msg = ros1_msg_event.getConstMessage();
 
     auto ros2_msg = std::make_shared<ROS2_T>();
     convert_1_to_2(*ros1_msg, *ros2_msg);
