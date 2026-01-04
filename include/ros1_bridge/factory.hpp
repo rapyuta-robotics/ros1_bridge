@@ -15,8 +15,10 @@
 #ifndef  ROS1_BRIDGE__FACTORY_HPP_
 #define  ROS1_BRIDGE__FACTORY_HPP_
 
+#include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -27,6 +29,15 @@
 #include "ros/message.h"
 
 #include "rcutils/logging_macros.h"
+
+// Global mutex to serialize service calls to external services (e.g., Unreal Engine)
+// This prevents overwhelming the service provider when many requests come in parallel
+namespace ros1_bridge {
+inline std::mutex & get_service_mutex() {
+  static std::mutex service_mutex;
+  return service_mutex;
+}
+}  // namespace ros1_bridge
 
 #include "ros1_bridge/factory_interface.hpp"
 
@@ -283,12 +294,28 @@ public:
     ros::ServiceClient client, rclcpp::Logger logger, const std::shared_ptr<rmw_request_id_t>,
     const std::shared_ptr<ROS2Request> request, std::shared_ptr<ROS2Response> response)
   {
+    // Serialize service calls to prevent overwhelming the ROS1 service provider
+    std::lock_guard<std::mutex> lock(ros1_bridge::get_service_mutex());
+
+    // Start timing the service call
+    auto start_time = std::chrono::steady_clock::now();
+
     ROS1_T srv;
     translate_2_to_1(*request, srv.request);
-    if (client.call(srv)) {
+    bool success = client.call(srv);
+
+    // Calculate elapsed time
+    auto end_time = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+    if (success) {
       translate_1_to_2(srv.response, *response);
+      RCLCPP_WARN(logger, "ROS1 service %s responded in %ld ms",
+        client.getService().c_str(), elapsed_ms);
     } else {
-      throw std::runtime_error("Failed to get response from ROS 1 service " + client.getService());
+      RCLCPP_ERROR(logger, "ROS1 service %s failed after %ld ms",
+        client.getService().c_str(), elapsed_ms);
+      // Note: ROS2 service will return empty/default response to caller
     }
   }
 
@@ -296,6 +323,9 @@ public:
     rclcpp::ClientBase::SharedPtr cli, rclcpp::Logger logger,
     const ROS1Request & request1, ROS1Response & response1)
   {
+    // Serialize service calls to prevent overwhelming the ROS2 service provider (e.g., UE)
+    std::lock_guard<std::mutex> lock(ros1_bridge::get_service_mutex());
+
     auto client = std::dynamic_pointer_cast<rclcpp::Client<ROS2_T>>(cli);
     if (!client) {
       RCLCPP_ERROR(logger, "Failed to get ROS 2 client %s", cli->get_service_name());
@@ -311,14 +341,34 @@ public:
       }
       RCLCPP_WARN(logger, "Waiting for ROS 2 service %s...", cli->get_service_name());
     }
-    auto timeout = std::chrono::seconds(5);
+    // Timeout configurable via environment variable, default 30s for heavy loads (e.g. 250 bots)
+    int timeout_sec = 30;
+    const char* timeout_env = std::getenv("ROS1_BRIDGE_SERVICE_TIMEOUT");
+    if (timeout_env) {
+      timeout_sec = std::atoi(timeout_env);
+      if (timeout_sec <= 0) timeout_sec = 30;
+    }
+    auto timeout = std::chrono::seconds(timeout_sec);
+
+    // Start timing the service call
+    auto start_time = std::chrono::steady_clock::now();
+
     auto future = client->async_send_request(request2);
     auto status = future.wait_for(timeout);
+
+    // Calculate elapsed time
+    auto end_time = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
     if (status == std::future_status::ready) {
       auto response2 = future.get();
       translate_2_to_1(*response2, response1);
+      // Log response time for successful calls
+      RCLCPP_WARN(logger, "ROS2 service %s responded in %ld ms",
+        cli->get_service_name(), elapsed_ms);
     } else {
-      RCLCPP_ERROR(logger, "Failed to get response from ROS 2 service %s", cli->get_service_name());
+      RCLCPP_ERROR(logger, "ROS2 service %s timed out after %ld ms (timeout: %ds)",
+        cli->get_service_name(), elapsed_ms, timeout_sec);
       return false;
     }
     return true;
@@ -328,6 +378,7 @@ public:
     ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name)
   {
     ServiceBridge1to2 bridge;
+    // ros2_node is the dedicated service node (passed from parameter_bridge)
     bridge.client = ros2_node->create_client<ROS2_T>(name);
     auto m = &ServiceFactory<ROS1_T, ROS2_T>::forward_1_to_2;
     auto f = std::bind(
@@ -348,6 +399,7 @@ public:
         const std::shared_ptr<rmw_request_id_t>,
         const std::shared_ptr<ROS2Request>,
         std::shared_ptr<ROS2Response>)> f;
+    // ros2_node is the dedicated service node (passed from parameter_bridge)
     f = std::bind(
       m, this, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
       std::placeholders::_2, std::placeholders::_3);
