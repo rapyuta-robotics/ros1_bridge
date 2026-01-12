@@ -689,12 +689,126 @@ int main(int argc, char * argv[])
   std::list<ros1_bridge::ServiceBridge2to1> service_bridges_2_to_1;
 
   // ============================================================
-  // INITIALIZATION ORDER: Services -> Clock -> Other Topics
-  // This ensures bots have access to services as soon as clock is enabled
+  // INITIALIZATION ORDER: Clock -> Services -> Other Topics
+  // Clock is the MOST CRITICAL topic - all timing depends on it.
+  // Initialize it FIRST so simulation time is available immediately.
+  // Services are initialized next so bots can spawn once clock is running.
   // ============================================================
 
-  // -------------------- SERVICES FIRST (partition 0 only) --------------------
+  // -------------------- CLOCK FIRST (ALL PARTITIONS) --------------------
+  // Pre-fetch topic parameters for clock priority processing
+  // Clock must be initialized before ANYTHING else including services
+  XmlRpc::XmlRpcValue topics;
+  bool has_topics = ros1_node.getParam(topics_parameter_name, topics) &&
+    topics.getType() == XmlRpc::XmlRpcValue::TypeArray;
+
+  XmlRpc::XmlRpcValue topics_2_to_1;
+  bool has_topics_2_to_1 = ros1_node.getParam(topics_2_to_1_parameter_name, topics_2_to_1) &&
+    topics_2_to_1.getType() == XmlRpc::XmlRpcValue::TypeArray;
+
+  // Helper lambda to create 2_to_1 bridge for clock (defined early for clock initialization)
+  // This is a simplified version specifically for /clock initialization
+  auto create_clock_bridge_2_to_1 = [&](XmlRpc::XmlRpcValue& topic_entry) -> bool {
+    std::string topic_name = static_cast<std::string>(topic_entry["topic"]);
+    std::string type_name = static_cast<std::string>(topic_entry["type"]);
+    size_t queue_size = static_cast<int>(topic_entry["queue_size"]);
+    if (!queue_size) {
+      queue_size = 100;
+    }
+
+    // Get node for this topic
+    auto ros2_node = topic_node_manager.get_node_for_topic();
+
+    LOG_INFO("[P%zu] Creating 2_to_1 bridge for topic '%s' with ROS 2 type '%s' on node '%s'",
+      g_partition_config.partition_index, topic_name.c_str(), type_name.c_str(), ros2_node->get_name());
+
+    try {
+      ros1_bridge::BridgeHandles handles;
+      handles.bridge2to1 = ros1_bridge::create_bridge_from_2_to_1(
+        ros2_node, ros1_node,
+        type_name, topic_name, queue_size, "", topic_name, queue_size);
+      all_handles.push_back(handles);
+      return true;
+    } catch (std::runtime_error & e) {
+      LOG_ERROR("failed to create 2_to_1 bridge for topic '%s': %s", topic_name.c_str(), e.what());
+      return false;
+    }
+  };
+
+  // Helper lambda to create bidirectional bridge for clock
+  auto create_clock_bridge_bidir = [&](XmlRpc::XmlRpcValue& topic_entry) -> bool {
+    std::string topic_name = static_cast<std::string>(topic_entry["topic"]);
+    std::string type_name = static_cast<std::string>(topic_entry["type"]);
+    size_t queue_size = static_cast<int>(topic_entry["queue_size"]);
+    if (!queue_size) {
+      queue_size = 100;
+    }
+
+    // Get node for this topic
+    auto ros2_node = topic_node_manager.get_node_for_topic();
+
+    LOG_INFO("[P%zu] Creating bidirectional bridge for topic '%s' with ROS 2 type '%s' on node '%s'",
+      g_partition_config.partition_index, topic_name.c_str(), type_name.c_str(), ros2_node->get_name());
+
+    try {
+      ros1_bridge::BridgeHandles handles = ros1_bridge::create_bidirectional_bridge(
+        ros1_node, ros2_node, "", type_name, topic_name, queue_size);
+      all_handles.push_back(handles);
+      return true;
+    } catch (std::runtime_error & e) {
+      LOG_ERROR("failed to create bidirectional bridge for topic '%s': %s", topic_name.c_str(), e.what());
+      return false;
+    }
+  };
+
+  // ==================== CLOCK PRIORITY (BEFORE SERVICES) ====================
+  // Only partition 0 handles /clock to avoid duplicate publishers
+  bool clock_initialized = false;
   if (g_partition_config.partition_index == 0) {
+    LOG_INFO("========================================");
+    LOG_INFO("Initializing /clock FIRST (highest priority)...");
+    LOG_INFO("========================================");
+
+    // /clock from topics_2_to_1 (preferred - unidirectional from ROS2)
+    if (has_topics_2_to_1) {
+      for (size_t i = 0; i < static_cast<size_t>(topics_2_to_1.size()); ++i) {
+        std::string topic_name = static_cast<std::string>(topics_2_to_1[i]["topic"]);
+        if (topic_name == "/clock") {
+          LOG_INFO("Setting up /clock from topics_2_to_1 (ROS2 -> ROS1)...");
+          if (create_clock_bridge_2_to_1(topics_2_to_1[i])) {
+            LOG_INFO("/clock bridge initialized (2_to_1). Simulation time is now available.");
+            clock_initialized = true;
+          }
+          break;
+        }
+      }
+    }
+
+    // /clock from bidirectional topics (fallback if not in topics_2_to_1)
+    if (!clock_initialized && has_topics) {
+      for (size_t i = 0; i < static_cast<size_t>(topics.size()); ++i) {
+        std::string topic_name = static_cast<std::string>(topics[i]["topic"]);
+        if (topic_name == "/clock") {
+          LOG_INFO("Setting up /clock from topics (bidirectional)...");
+          if (create_clock_bridge_bidir(topics[i])) {
+            LOG_INFO("/clock bridge initialized (bidirectional). Simulation time is now available.");
+            clock_initialized = true;
+          }
+          break;
+        }
+      }
+    }
+
+    if (!clock_initialized) {
+      LOG_WARN("/clock topic not found in configuration. Simulation time may not be available!");
+    }
+  }
+
+  // -------------------- SERVICES SECOND (partition 0 only) --------------------
+  if (g_partition_config.partition_index == 0) {
+  LOG_INFO("========================================");
+  LOG_INFO("Initializing services...");
+  LOG_INFO("========================================");
   // ROS 1 Services in ROS 2
   XmlRpc::XmlRpcValue services_1_to_2;
   if (
@@ -795,10 +909,12 @@ int main(int argc, char * argv[])
       services_2_to_1_parameter_name);
   }
 
-  LOG_INFO("Services initialized. Now setting up topics (clock first)...");
+  LOG_INFO("Services initialized. Now setting up remaining topics...");
   }  // End of partition 0 services block
 
-  // -------------------- TOPICS (CLOCK FIRST) --------------------
+  // -------------------- REMAINING TOPICS --------------------
+  // NOTE: /clock is already initialized above (highest priority)
+  //
   // PERFORMANCE NOTE: ROS1 has a single PollManager thread that processes ALL
   // publication queues (ros::Publication::processPublishQueue). With 300+ bots
   // publishing high-frequency topics (model_state @ 30Hz), this becomes a bottleneck.
@@ -899,46 +1015,11 @@ int main(int argc, char * argv[])
     }
   };
 
-  // Pre-fetch topic parameters for clock priority processing
-  XmlRpc::XmlRpcValue topics;
-  bool has_topics = ros1_node.getParam(topics_parameter_name, topics) &&
-    topics.getType() == XmlRpc::XmlRpcValue::TypeArray;
-
-  XmlRpc::XmlRpcValue topics_2_to_1;
-  bool has_topics_2_to_1 = ros1_node.getParam(topics_2_to_1_parameter_name, topics_2_to_1) &&
-    topics_2_to_1.getType() == XmlRpc::XmlRpcValue::TypeArray;
-
-  // ==================== CLOCK PRIORITY ====================
-  // Process /clock from all topic arrays FIRST before any other topics
-
-  // /clock from bidirectional topics
-  if (has_topics) {
-    for (size_t i = 0; i < static_cast<size_t>(topics.size()); ++i) {
-      std::string topic_name = static_cast<std::string>(topics[i]["topic"]);
-      if (topic_name == "/clock") {
-        LOG_INFO("Setting up priority topic /clock first (from topics)...");
-        create_topic_bridge(topics[i]);
-        LOG_INFO("/clock bridge initialized (bidirectional).");
-        break;
-      }
-    }
-  }
-
-  // /clock from topics_2_to_1
-  if (has_topics_2_to_1) {
-    for (size_t i = 0; i < static_cast<size_t>(topics_2_to_1.size()); ++i) {
-      std::string topic_name = static_cast<std::string>(topics_2_to_1[i]["topic"]);
-      if (topic_name == "/clock") {
-        LOG_INFO("Setting up priority topic /clock first (from topics_2_to_1)...");
-        create_2_to_1_bridge(topics_2_to_1[i]);
-        LOG_INFO("/clock bridge initialized (2_to_1).");
-        break;
-      }
-    }
-  }
-
   // ==================== OTHER TOPICS ====================
   // Now process all other topics (excluding /clock which is already done)
+  LOG_INFO("========================================");
+  LOG_INFO("Initializing remaining topics...");
+  LOG_INFO("========================================");
 
   // Bidirectional topics (excluding /clock)
   if (has_topics) {
