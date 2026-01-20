@@ -465,26 +465,44 @@ int main(int argc, char * argv[])
   //   argv[3]: services_2_to_1
   //   argv[4]: topics_1_to_2 (optional, new)
   //   argv[5]: topics_2_to_1 (optional, new)
+  //
+  // Filter out ROS-specific arguments (starting with "__" like __name:=, __ns:=, __log:=)
+  // These are remapping arguments handled by ROS init, not parameter names.
+  std::vector<std::string> filtered_args;
+  filtered_args.push_back(argv[0]);  // Keep program name
+  for (int i = 1; i < argc; ++i) {
+    std::string arg(argv[i]);
+    // Skip ROS remapping arguments (start with __ or contain :=__ patterns)
+    if (arg.rfind("__", 0) == 0 || arg.find(":=__") != std::string::npos) {
+      continue;  // Skip ROS-specific arguments
+    }
+    // Skip arguments starting with - (ROS options like --ros-args)
+    if (arg.rfind("-", 0) == 0) {
+      continue;
+    }
+    filtered_args.push_back(arg);
+  }
+
   const char * topics_parameter_name = "topics";
   const char * services_1_to_2_parameter_name = "services_1_to_2";
   const char * services_2_to_1_parameter_name = "services_2_to_1";
   const char * topics_1_to_2_parameter_name = "topics_1_to_2";
   const char * topics_2_to_1_parameter_name = "topics_2_to_1";
 
-  if (argc > 1) {
-    topics_parameter_name = argv[1];
+  if (filtered_args.size() > 1) {
+    topics_parameter_name = filtered_args[1].c_str();
   }
-  if (argc > 2) {
-    services_1_to_2_parameter_name = argv[2];
+  if (filtered_args.size() > 2) {
+    services_1_to_2_parameter_name = filtered_args[2].c_str();
   }
-  if (argc > 3) {
-    services_2_to_1_parameter_name = argv[3];
+  if (filtered_args.size() > 3) {
+    services_2_to_1_parameter_name = filtered_args[3].c_str();
   }
-  if (argc > 4) {
-    topics_1_to_2_parameter_name = argv[4];
+  if (filtered_args.size() > 4) {
+    topics_1_to_2_parameter_name = filtered_args[4].c_str();
   }
-  if (argc > 5) {
-    topics_2_to_1_parameter_name = argv[5];
+  if (filtered_args.size() > 5) {
+    topics_2_to_1_parameter_name = filtered_args[5].c_str();
   }
 
   // ============================================================
