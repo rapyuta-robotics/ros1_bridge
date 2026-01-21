@@ -34,6 +34,8 @@ struct ServiceBridge1to2
 {
   ros::ServiceServer server;
   rclcpp::ClientBase::SharedPtr client;
+  rclcpp::Node::SharedPtr ros2_node;  // Keep reference to recreate client on failure
+  std::string service_name;           // Keep service name for recreation
 };
 
 struct ServiceBridge2to1

@@ -20,7 +20,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "rmw/rmw.h"
 #include "rclcpp/rclcpp.hpp"
@@ -320,72 +322,131 @@ public:
   }
 
   bool forward_1_to_2(
-    rclcpp::ClientBase::SharedPtr cli, rclcpp::Logger logger,
+    ServiceBridge1to2 * bridge, rclcpp::Logger logger,
     const ROS1Request & request1, ROS1Response & response1)
   {
     // Serialize service calls to prevent overwhelming the ROS2 service provider (e.g., UE)
     std::lock_guard<std::mutex> lock(ros1_bridge::get_service_mutex());
 
-    auto client = std::dynamic_pointer_cast<rclcpp::Client<ROS2_T>>(cli);
+    auto client = std::dynamic_pointer_cast<rclcpp::Client<ROS2_T>>(bridge->client);
     if (!client) {
-      RCLCPP_ERROR(logger, "Failed to get ROS 2 client %s", cli->get_service_name());
+      RCLCPP_ERROR(logger, "Failed to get ROS 2 client");
       return false;
     }
+
     auto request2 = std::make_shared<ROS2Request>();
     translate_1_to_2(request1, *request2);
-    while (!client->wait_for_service(std::chrono::seconds(1))) {
-      if (!rclcpp::ok()) {
-        RCLCPP_ERROR(
-          logger, "Interrupted while waiting for ROS 2 service %s", cli->get_service_name());
-        return false;
-      }
-      RCLCPP_WARN(logger, "Waiting for ROS 2 service %s...", cli->get_service_name());
-    }
-    // Timeout configurable via environment variable, default 30s for heavy loads (e.g. 250 bots)
-    int timeout_sec = 30;
+
+    // Timeout configurable via environment variable, default 15s
+    int timeout_sec = 15;
     const char* timeout_env = std::getenv("ROS1_BRIDGE_SERVICE_TIMEOUT");
     if (timeout_env) {
       timeout_sec = std::atoi(timeout_env);
-      if (timeout_sec <= 0) timeout_sec = 30;
+      if (timeout_sec <= 0) timeout_sec = 15;
     }
     auto timeout = std::chrono::seconds(timeout_sec);
 
-    // Start timing the service call
-    auto start_time = std::chrono::steady_clock::now();
+    // Retry configuration
+    const int max_retries = 2;  // Total attempts = 1 + max_retries
+    int retry_count = 0;
 
-    auto future = client->async_send_request(request2);
-    auto status = future.wait_for(timeout);
+    while (retry_count <= max_retries) {
+      // Wait for service discovery
+      int wait_attempts = 0;
+      const int max_wait_attempts = 10;  // Max 10 seconds waiting for discovery
+      while (!client->wait_for_service(std::chrono::seconds(1))) {
+        if (!rclcpp::ok()) {
+          RCLCPP_ERROR(logger, "Interrupted while waiting for ROS 2 service %s",
+            bridge->service_name.c_str());
+          return false;
+        }
+        wait_attempts++;
+        if (wait_attempts >= max_wait_attempts) {
+          RCLCPP_WARN(logger, "Service %s not discovered after %d seconds, will recreate client",
+            bridge->service_name.c_str(), max_wait_attempts);
+          break;
+        }
+        RCLCPP_WARN(logger, "Waiting for ROS 2 service %s... (%d/%d)",
+          bridge->service_name.c_str(), wait_attempts, max_wait_attempts);
+      }
 
-    // Calculate elapsed time
-    auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+      // Start timing the service call
+      auto start_time = std::chrono::steady_clock::now();
 
-    if (status == std::future_status::ready) {
-      auto response2 = future.get();
-      translate_2_to_1(*response2, response1);
-      // Log response time for successful calls
-      RCLCPP_WARN(logger, "ROS2 service %s responded in %ld ms",
-        cli->get_service_name(), elapsed_ms);
-    } else {
-      RCLCPP_ERROR(logger, "ROS2 service %s timed out after %ld ms (timeout: %ds)",
-        cli->get_service_name(), elapsed_ms, timeout_sec);
-      return false;
+      auto future = client->async_send_request(request2);
+      auto status = future.wait_for(timeout);
+
+      // Calculate elapsed time
+      auto end_time = std::chrono::steady_clock::now();
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+      if (status == std::future_status::ready) {
+        auto response2 = future.get();
+        translate_2_to_1(*response2, response1);
+        // Log response time for successful calls
+        RCLCPP_WARN(logger, "ROS2 service %s responded in %ld ms",
+          bridge->service_name.c_str(), elapsed_ms);
+        return true;
+      }
+
+      // Timeout occurred
+      retry_count++;
+      if (retry_count <= max_retries) {
+        RCLCPP_WARN(logger, "ROS2 service %s timed out after %ld ms, recreating client (retry %d/%d)",
+          bridge->service_name.c_str(), elapsed_ms, retry_count, max_retries);
+
+        // Recreate the client to force DDS re-discovery
+        // This is the key fix for FastDDS discovery server stale endpoint issues
+        bridge->client.reset();
+        bridge->client = bridge->ros2_node->create_client<ROS2_T>(bridge->service_name);
+        client = std::dynamic_pointer_cast<rclcpp::Client<ROS2_T>>(bridge->client);
+
+        if (!client) {
+          RCLCPP_ERROR(logger, "Failed to recreate ROS 2 client for %s",
+            bridge->service_name.c_str());
+          return false;
+        }
+
+        RCLCPP_INFO(logger, "Recreated ROS2 service client for %s, retrying...",
+          bridge->service_name.c_str());
+
+        // Small delay to allow discovery to propagate
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      } else {
+        RCLCPP_ERROR(logger, "ROS2 service %s timed out after %ld ms (timeout: %ds), max retries exhausted",
+          bridge->service_name.c_str(), elapsed_ms, timeout_sec);
+        return false;
+      }
     }
-    return true;
+
+    return false;
   }
 
   ServiceBridge1to2 service_bridge_1_to_2(
     ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name)
   {
     ServiceBridge1to2 bridge;
+    // Store node and name for client recreation on timeout
+    bridge.ros2_node = ros2_node;
+    bridge.service_name = name;
     // ros2_node is the dedicated service node (passed from parameter_bridge)
     bridge.client = ros2_node->create_client<ROS2_T>(name);
+
+    // Create a shared_ptr to the bridge that will be stored in service_bridges_1_to_2
+    // We need to use a raw pointer in the callback since the bridge will be moved
+    auto bridge_ptr = std::make_shared<ServiceBridge1to2>(std::move(bridge));
+
     auto m = &ServiceFactory<ROS1_T, ROS2_T>::forward_1_to_2;
     auto f = std::bind(
-      m, this, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
+      m, this, bridge_ptr.get(), ros2_node->get_logger(), std::placeholders::_1,
       std::placeholders::_2);
-    bridge.server = ros1_node.advertiseService<ROS1Request, ROS1Response>(name, f);
-    return bridge;
+    bridge_ptr->server = ros1_node.advertiseService<ROS1Request, ROS1Response>(name, f);
+
+    // Store the shared_ptr in a static map to keep it alive
+    static std::vector<std::shared_ptr<ServiceBridge1to2>> bridge_storage;
+    bridge_storage.push_back(bridge_ptr);
+
+    return *bridge_ptr;
   }
 
   ServiceBridge2to1 service_bridge_2_to_1(
