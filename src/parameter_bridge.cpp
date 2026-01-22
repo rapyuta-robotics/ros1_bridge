@@ -14,6 +14,7 @@
 
 #include <xmlrpcpp/XmlRpcException.h>
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
@@ -1162,6 +1163,92 @@ int main(int argc, char * argv[])
     });
   }
 
+  // ============================================================
+  // Service Discovery Keepalive Thread (partition 0 only)
+  // ============================================================
+  // FastDDS Discovery Server can have stale discovery state, causing service
+  // calls to timeout even when the service is available. Creating a fresh
+  // throwaway node and checking service availability periodically "warms up"
+  // the DDS discovery graph for all participants.
+  //
+  // This mimics what happens when you run `ros2 service call` from CLI -
+  // it creates a fresh node which triggers full discovery handshake.
+  // ============================================================
+  std::atomic<bool> keepalive_running{true};
+  std::thread service_keepalive_thread;
+
+  if (g_partition_config.partition_index == 0 && !service_bridges_1_to_2.empty()) {
+    // Collect service names for keepalive checks
+    std::vector<std::string> service_names_for_keepalive;
+    for (const auto& bridge : service_bridges_1_to_2) {
+      service_names_for_keepalive.push_back(bridge.service_name);
+    }
+
+    LOG_INFO("Starting service discovery keepalive thread for %zu services",
+      service_names_for_keepalive.size());
+
+    service_keepalive_thread = std::thread([service_names_for_keepalive, &keepalive_running]() {
+      // Keepalive interval - check every 5 seconds
+      const int keepalive_interval_sec = 5;
+
+      LOG_INFO("Service keepalive thread started (interval: %ds)", keepalive_interval_sec);
+
+      while (keepalive_running.load() && rclcpp::ok()) {
+        // Sleep first to give services time to initialize on first run
+        for (int i = 0; i < keepalive_interval_sec * 10 && keepalive_running.load(); ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!keepalive_running.load() || !rclcpp::ok()) {
+          break;
+        }
+
+        // Create a THROWAWAY node with fresh DDS participant
+        // This forces a complete discovery handshake with the discovery server
+        try {
+          rclcpp::NodeOptions throwaway_options;
+          throwaway_options.use_global_arguments(false);
+          auto throwaway_node = rclcpp::Node::make_shared(
+            "ros12_bridge_keepalive_" + std::to_string(std::rand() % 10000),
+            throwaway_options);
+
+          LOG_INFO("[Keepalive] Checking %zu services with throwaway node '%s'...",
+            service_names_for_keepalive.size(), throwaway_node->get_name());
+
+          // Query all available services using graph API
+          // This triggers DDS discovery without needing service types
+          auto service_names_and_types = throwaway_node->get_service_names_and_types();
+
+          // Check which of our services are discovered
+          for (const auto& service_name : service_names_for_keepalive) {
+            if (!keepalive_running.load() || !rclcpp::ok()) {
+              break;
+            }
+
+            bool available = false;
+            for (const auto& [name, types] : service_names_and_types) {
+              if (name == service_name) {
+                available = true;
+                break;
+              }
+            }
+            LOG_INFO("[Keepalive] Service '%s': %s",
+              service_name.c_str(), available ? "AVAILABLE" : "NOT AVAILABLE");
+          }
+
+          // Explicitly destroy throwaway node to clean up DDS resources
+          throwaway_node.reset();
+          LOG_INFO("[Keepalive] Throwaway node destroyed, discovery refreshed");
+
+        } catch (const std::exception& e) {
+          LOG_WARN("[Keepalive] Exception during discovery check: %s", e.what());
+        }
+      }
+
+      LOG_INFO("Service keepalive thread exiting");
+    });
+  }
+
   // Create a dedicated SingleThreadedExecutor + thread for each topic node
   // This ensures each node has its own isolated waitset (~1000 topics max)
   const auto& topic_nodes = topic_node_manager.get_all_nodes();
@@ -1223,6 +1310,14 @@ int main(int argc, char * argv[])
   }
 
   // Cleanup - cancel all executors and join threads
+  // Stop keepalive thread first
+  keepalive_running.store(false);
+  if (service_keepalive_thread.joinable()) {
+    LOG_INFO("Waiting for service keepalive thread to exit...");
+    service_keepalive_thread.join();
+    LOG_INFO("Service keepalive thread joined");
+  }
+
   if (service_executor) {
     service_executor->cancel();
   }
