@@ -351,7 +351,7 @@ public:
     int retry_count = 0;
 
     while (retry_count <= max_retries) {
-      // Wait for service discovery
+       // Wait for service discovery
       int wait_attempts = 0;
       const int max_wait_attempts = 10;  // Max 10 seconds waiting for discovery
       while (!client->wait_for_service(std::chrono::seconds(1))) {
@@ -423,12 +423,14 @@ public:
   }
 
   ServiceBridge1to2 service_bridge_1_to_2(
-    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name)
+    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name,
+    const std::string & service_type = "") override
   {
     ServiceBridge1to2 bridge;
     // Store node and name for client recreation on timeout
     bridge.ros2_node = ros2_node;
     bridge.service_name = name;
+    bridge.service_type = service_type;  // Store for proactive keepalive refresh
     // ros2_node is the dedicated service node (passed from parameter_bridge)
     bridge.client = ros2_node->create_client<ROS2_T>(name);
 
@@ -450,7 +452,7 @@ public:
   }
 
   ServiceBridge2to1 service_bridge_2_to_1(
-    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name)
+    ros::NodeHandle & ros1_node, rclcpp::Node::SharedPtr ros2_node, const std::string & name) override
   {
     ServiceBridge2to1 bridge;
     bridge.client = ros1_node.serviceClient<ROS1_T>(name);
@@ -467,6 +469,7 @@ public:
     bridge.server = ros2_node->create_service<ROS2_T>(name, f);
     return bridge;
   }
+
 
 private:
   void translate_1_to_2(const ROS1Request &, ROS2Request &);

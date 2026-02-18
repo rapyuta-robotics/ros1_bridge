@@ -862,7 +862,7 @@ int main(int argc, char * argv[])
         try {
           service_bridges_1_to_2.push_back(
             factory->service_bridge_1_to_2(
-              ros1_node, ros2_service_node, service_name));
+              ros1_node, ros2_service_node, service_name, type_name));
           LOG_INFO("Created 1 to 2 bridge for service %s", service_name.c_str());
         } catch (std::runtime_error & e) {
           LOG_ERROR("failed to create bridge ROS 1 service '%s' with type '%s': %s",
@@ -1166,82 +1166,80 @@ int main(int argc, char * argv[])
   // ============================================================
   // Service Discovery Keepalive Thread (partition 0 only)
   // ============================================================
-  // FastDDS Discovery Server can have stale discovery state, causing service
-  // calls to timeout even when the service is available. Creating a fresh
-  // throwaway node and checking service availability periodically "warms up"
-  // the DDS discovery graph for all participants.
+  // FastDDS Discovery Server can have stale discovery state at startup,
+  // causing service calls to timeout even when the service is available.
   //
-  // This mimics what happens when you run `ros2 service call` from CLI -
-  // it creates a fresh node which triggers full discovery handshake.
+  // IMPORTANT: Recreating clients within the same process doesn't fix this
+  // because the stale state is at the DDS participant level, not client level.
+  //
+  // The fix: Use subprocess to call `ros2 service call` which creates a
+  // completely fresh DDS participant. This is exactly what works when you
+  // manually run `ros2 service call /GetEntityState` from CLI.
   // ============================================================
   std::atomic<bool> keepalive_running{true};
   std::thread service_keepalive_thread;
 
   if (g_partition_config.partition_index == 0 && !service_bridges_1_to_2.empty()) {
-    // Collect service names for keepalive checks
-    std::vector<std::string> service_names_for_keepalive;
+    // Collect service info for keepalive warmup
+    struct ServiceWarmupInfo {
+      std::string service_name;
+      std::string service_type;
+    };
+    std::vector<ServiceWarmupInfo> warmup_services;
     for (const auto& bridge : service_bridges_1_to_2) {
-      service_names_for_keepalive.push_back(bridge.service_name);
+      warmup_services.push_back({bridge.service_name, bridge.service_type});
     }
 
-    LOG_INFO("Starting service discovery keepalive thread for %zu services",
-      service_names_for_keepalive.size());
+    LOG_INFO("Starting service keepalive thread for %zu services (subprocess warmup)",
+      warmup_services.size());
 
-    service_keepalive_thread = std::thread([service_names_for_keepalive, &keepalive_running]() {
-      // Keepalive interval - check every 5 seconds
-      const int keepalive_interval_sec = 5;
+    service_keepalive_thread = std::thread([warmup_services, &keepalive_running]() {
+      // Warmup interval - call subprocess periodically
+      // Start with initial delay to let services initialize
+      const int initial_delay_sec = 15;
+      const int warmup_interval_sec = 60;  // Check every 60 seconds
 
-      LOG_INFO("Service keepalive thread started (interval: %ds)", keepalive_interval_sec);
+      LOG_INFO("Service keepalive thread started (subprocess warmup every %ds, initial delay %ds)",
+        warmup_interval_sec, initial_delay_sec);
+
+      // Initial delay
+      for (int i = 0; i < initial_delay_sec * 10 && keepalive_running.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
 
       while (keepalive_running.load() && rclcpp::ok()) {
-        // Sleep first to give services time to initialize on first run
-        for (int i = 0; i < keepalive_interval_sec * 10 && keepalive_running.load(); ++i) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        LOG_INFO("[Keepalive] Running subprocess warmup for %zu services...", warmup_services.size());
 
-        if (!keepalive_running.load() || !rclcpp::ok()) {
-          break;
-        }
-
-        // Create a THROWAWAY node with fresh DDS participant
-        // This forces a complete discovery handshake with the discovery server
-        try {
-          rclcpp::NodeOptions throwaway_options;
-          throwaway_options.use_global_arguments(false);
-          auto throwaway_node = rclcpp::Node::make_shared(
-            "ros12_bridge_keepalive_" + std::to_string(std::rand() % 10000),
-            throwaway_options);
-
-          LOG_INFO("[Keepalive] Checking %zu services with throwaway node '%s'...",
-            service_names_for_keepalive.size(), throwaway_node->get_name());
-
-          // Query all available services using graph API
-          // This triggers DDS discovery without needing service types
-          auto service_names_and_types = throwaway_node->get_service_names_and_types();
-
-          // Check which of our services are discovered
-          for (const auto& service_name : service_names_for_keepalive) {
-            if (!keepalive_running.load() || !rclcpp::ok()) {
-              break;
-            }
-
-            bool available = false;
-            for (const auto& [name, types] : service_names_and_types) {
-              if (name == service_name) {
-                available = true;
-                break;
-              }
-            }
-            LOG_INFO("[Keepalive] Service '%s': %s",
-              service_name.c_str(), available ? "AVAILABLE" : "NOT AVAILABLE");
+        // Call each service via subprocess to force fresh DDS discovery
+        // This mimics: ros2 service call /ServiceName service_type/srv/Type
+        for (const auto& info : warmup_services) {
+          if (!keepalive_running.load() || !rclcpp::ok()) {
+            break;
           }
 
-          // Explicitly destroy throwaway node to clean up DDS resources
-          throwaway_node.reset();
-          LOG_INFO("[Keepalive] Throwaway node destroyed, discovery refreshed");
+          // Convert type from "package/srv/Type" format to ROS2 CLI format
+          // e.g., "ue_msgs/srv/GetEntityState" stays as is
+          std::string cmd = "timeout 5 ros2 service call " + info.service_name + " " +
+                           info.service_type + " \"{}\" >/dev/null 2>&1";
 
-        } catch (const std::exception& e) {
-          LOG_WARN("[Keepalive] Exception during discovery check: %s", e.what());
+          LOG_INFO("[Keepalive] Warming up service '%s' via subprocess...", info.service_name.c_str());
+
+          int result = std::system(cmd.c_str());
+          if (result == 0) {
+            LOG_INFO("[Keepalive] Service '%s' warmup successful", info.service_name.c_str());
+          } else {
+            // Non-zero exit is okay - service might return error for empty request
+            // The important thing is DDS discovery happened
+            LOG_INFO("[Keepalive] Service '%s' warmup completed (exit=%d, discovery triggered)",
+              info.service_name.c_str(), result);
+          }
+        }
+
+        LOG_INFO("[Keepalive] Subprocess warmup complete");
+
+        // Sleep until next warmup interval
+        for (int i = 0; i < warmup_interval_sec * 10 && keepalive_running.load(); ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
       }
 
