@@ -1217,9 +1217,11 @@ int main(int argc, char * argv[])
             break;
           }
 
-          // Build command - use single quotes for empty request to avoid shell escaping issues
-          std::string cmd = "timeout 5 ros2 service call " + info.service_name + " " +
-                           info.service_type + " '{}'";
+          // Build command - source ROS2 setup first, then call service
+          // Use bash -c to run the compound command
+          std::string cmd = "bash -c 'source /home/ros2_ws/install/setup.bash && "
+                           "timeout 5 ros2 service call " + info.service_name + " " +
+                           info.service_type + "'";
 
           LOG_INFO("[Keepalive] Executing: %s", cmd.c_str());
 
@@ -1242,7 +1244,6 @@ int main(int argc, char * argv[])
 
             if (exit_code == 0) {
               LOG_INFO("[Keepalive] Service '%s' warmup successful (exit=0)", info.service_name.c_str());
-              LOG_INFO("[Keepalive] Output: %s", output.empty() ? "(none)" : output.c_str());
             } else {
               LOG_WARN("[Keepalive] Service '%s' warmup failed (exit=%d)", info.service_name.c_str(), exit_code);
               LOG_WARN("[Keepalive] Output: %s", output.empty() ? "(none)" : output.c_str());
