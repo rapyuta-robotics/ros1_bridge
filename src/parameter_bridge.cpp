@@ -1217,21 +1217,38 @@ int main(int argc, char * argv[])
             break;
           }
 
-          // Convert type from "package/srv/Type" format to ROS2 CLI format
-          // e.g., "ue_msgs/srv/GetEntityState" stays as is
+          // Build command - use single quotes for empty request to avoid shell escaping issues
           std::string cmd = "timeout 5 ros2 service call " + info.service_name + " " +
-                           info.service_type + " \"{}\" >/dev/null 2>&1";
+                           info.service_type + " '{}'";
 
-          LOG_INFO("[Keepalive] Warming up service '%s' via subprocess...", info.service_name.c_str());
+          LOG_INFO("[Keepalive] Executing: %s", cmd.c_str());
 
-          int result = std::system(cmd.c_str());
-          if (result == 0) {
-            LOG_INFO("[Keepalive] Service '%s' warmup successful", info.service_name.c_str());
+          // Capture output by redirecting to a temp approach using popen
+          std::string full_cmd = cmd + " 2>&1";
+          FILE* pipe = popen(full_cmd.c_str(), "r");
+          std::string output;
+          if (pipe) {
+            char buffer[256];
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+              output += buffer;
+            }
+            int status = pclose(pipe);
+            int exit_code = WEXITSTATUS(status);
+
+            // Remove trailing newline for cleaner logging
+            while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+              output.pop_back();
+            }
+
+            if (exit_code == 0) {
+              LOG_INFO("[Keepalive] Service '%s' warmup successful (exit=0)", info.service_name.c_str());
+              LOG_INFO("[Keepalive] Output: %s", output.empty() ? "(none)" : output.c_str());
+            } else {
+              LOG_WARN("[Keepalive] Service '%s' warmup failed (exit=%d)", info.service_name.c_str(), exit_code);
+              LOG_WARN("[Keepalive] Output: %s", output.empty() ? "(none)" : output.c_str());
+            }
           } else {
-            // Non-zero exit is okay - service might return error for empty request
-            // The important thing is DDS discovery happened
-            LOG_INFO("[Keepalive] Service '%s' warmup completed (exit=%d, discovery triggered)",
-              info.service_name.c_str(), result);
+            LOG_ERROR("[Keepalive] Failed to execute command for '%s'", info.service_name.c_str());
           }
         }
 
