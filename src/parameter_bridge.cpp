@@ -1217,9 +1217,10 @@ int main(int argc, char * argv[])
             break;
           }
 
-          // Build command - clear ROS env vars first to avoid mixing ROS1/ROS2 paths,
+          // Build command - clear conflicting ROS env vars first to avoid mixing ROS1/ROS2 paths,
           // then source ROS2 setup and call service
-          std::string cmd = "bash -c 'unset ROS_DISTRO AMENT_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH && "
+          // Note: Keep PYTHONPATH and LD_LIBRARY_PATH as unsetting them causes issues
+          std::string cmd = "bash -c 'unset ROS_DISTRO AMENT_PREFIX_PATH CMAKE_PREFIX_PATH && "
                            "source /home/ros2_ws/install/setup.bash && "
                            "timeout 5 ros2 service call " + info.service_name + " " +
                            info.service_type + "'";
