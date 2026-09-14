@@ -13,6 +13,7 @@ endif()
 find_package(rmw REQUIRED)
 
 find_package(ament_cmake REQUIRED)
+include(cmake/ament_target_dependencies_compat.cmake)
 find_package(rclcpp REQUIRED)
 find_package(rmw_implementation_cmake REQUIRED)
 find_package(std_msgs REQUIRED)
