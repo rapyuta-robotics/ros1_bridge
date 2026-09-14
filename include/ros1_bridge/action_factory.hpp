@@ -358,6 +358,10 @@ private:
             ROS_INFO("Goal [%s]", goal_handle.getTerminalState().toString().c_str());
             if (goal_handle.getTerminalState() == actionlib::TerminalState::SUCCEEDED) {
               gh2_->succeed(result2);
+            } else if (goal_handle.getTerminalState() == actionlib::TerminalState::PREEMPTED ||
+              goal_handle.getTerminalState() == actionlib::TerminalState::RECALLED)
+            {
+              gh2_->canceled(result2);
             } else {
               gh2_->abort(result2);
             }
