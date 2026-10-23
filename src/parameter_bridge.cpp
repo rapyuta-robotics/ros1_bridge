@@ -256,6 +256,10 @@ int main(int argc, char * argv[])
   // type: the type of the service to bridge (e.g. 'pkgname/srv/SrvName')
   const char * services_1_to_2_parameter_name = "services_1_to_2";
   const char * services_2_to_1_parameter_name = "services_2_to_1";
+  // same keys as topics; bridged from ROS 2 to ROS 1 only, and qos applies to the ROS 2 subscriber
+  const char * topics_2_to_1_parameter_name = "topics_2_to_1";
+  // same keys as topics; bridged from ROS 1 to ROS 2 only, and qos applies to the ROS 2 publisher
+  const char * topics_1_to_2_parameter_name = "topics_1_to_2";
   const char * service_execution_timeout_parameter_name =
     "ros1_bridge/parameter_bridge/service_execution_timeout";
   if (argc > 1) {
@@ -266,6 +270,12 @@ int main(int argc, char * argv[])
   }
   if (argc > 3) {
     services_2_to_1_parameter_name = argv[3];
+  }
+  if (argc > 4) {
+    topics_2_to_1_parameter_name = argv[4];
+  }
+  if (argc > 5) {
+    topics_1_to_2_parameter_name = argv[5];
   }
 
   // Topics
@@ -311,6 +321,96 @@ int main(int argc, char * argv[])
     fprintf(
       stderr,
       "The parameter '%s' either doesn't exist or isn't an array\n", topics_parameter_name);
+  }
+
+  // ROS 2 topics in ROS 1; a transient_local qos latches the ROS 1 publisher
+  XmlRpc::XmlRpcValue topics_2_to_1;
+  if (
+    ros1_node.getParam(topics_2_to_1_parameter_name, topics_2_to_1) &&
+    topics_2_to_1.getType() == XmlRpc::XmlRpcValue::TypeArray)
+  {
+    for (size_t i = 0; i < static_cast<size_t>(topics_2_to_1.size()); ++i) {
+      std::string topic_name = static_cast<std::string>(topics_2_to_1[i]["topic"]);
+      std::string type_name = static_cast<std::string>(topics_2_to_1[i]["type"]);
+      size_t queue_size = static_cast<int>(topics_2_to_1[i]["queue_size"]);
+      if (!queue_size) {
+        queue_size = 100;
+      }
+      printf(
+        "Trying to create 2 to 1 bridge for topic '%s' "
+        "with ROS 2 type '%s'\n",
+        topic_name.c_str(), type_name.c_str());
+
+      try {
+        rclcpp::QoS qos_settings = rclcpp::SensorDataQoS(rclcpp::KeepLast(queue_size));
+        if (topics_2_to_1[i].hasMember("qos")) {
+          printf("Setting up QoS for '%s': ", topic_name.c_str());
+          qos_settings = qos_from_params(topics_2_to_1[i]["qos"]);
+          printf("\n");
+        }
+        const bool latch = qos_settings.durability() == rclcpp::DurabilityPolicy::TransientLocal;
+        auto factory = ros1_bridge::get_factory("", type_name);
+        ros1_bridge::BridgeHandles handles;
+        handles.bridge2to1.ros1_publisher =
+          factory->create_ros1_publisher(ros1_node, topic_name, queue_size, latch);
+        handles.bridge2to1.ros2_subscriber = factory->create_ros2_subscriber(
+          ros2_node, topic_name, qos_settings, handles.bridge2to1.ros1_publisher);
+        all_handles.push_back(handles);
+      } catch (std::runtime_error & e) {
+        fprintf(
+          stderr,
+          "failed to create 2 to 1 bridge for topic '%s' "
+          "with ROS 2 type '%s': %s\n",
+          topic_name.c_str(), type_name.c_str(), e.what());
+      }
+    }
+  } else {
+    fprintf(
+      stderr,
+      "The parameter '%s' either doesn't exist or isn't an array\n", topics_2_to_1_parameter_name);
+  }
+
+  // ROS 1 topics in ROS 2, without the ROS 2 subscriber that would echo them back
+  XmlRpc::XmlRpcValue topics_1_to_2;
+  if (
+    ros1_node.getParam(topics_1_to_2_parameter_name, topics_1_to_2) &&
+    topics_1_to_2.getType() == XmlRpc::XmlRpcValue::TypeArray)
+  {
+    for (size_t i = 0; i < static_cast<size_t>(topics_1_to_2.size()); ++i) {
+      std::string topic_name = static_cast<std::string>(topics_1_to_2[i]["topic"]);
+      std::string type_name = static_cast<std::string>(topics_1_to_2[i]["type"]);
+      size_t queue_size = static_cast<int>(topics_1_to_2[i]["queue_size"]);
+      if (!queue_size) {
+        queue_size = 100;
+      }
+      printf(
+        "Trying to create 1 to 2 bridge for topic '%s' "
+        "with ROS 2 type '%s'\n",
+        topic_name.c_str(), type_name.c_str());
+
+      try {
+        rclcpp::QoS qos_settings = rclcpp::QoS(rclcpp::KeepLast(queue_size));
+        if (topics_1_to_2[i].hasMember("qos")) {
+          printf("Setting up QoS for '%s': ", topic_name.c_str());
+          qos_settings = qos_from_params(topics_1_to_2[i]["qos"]);
+          printf("\n");
+        }
+        ros1_bridge::BridgeHandles handles;
+        handles.bridge1to2 = ros1_bridge::create_bridge_from_1_to_2(
+          ros1_node, ros2_node, "", topic_name, queue_size, type_name, topic_name, qos_settings);
+        all_handles.push_back(handles);
+      } catch (std::runtime_error & e) {
+        fprintf(
+          stderr,
+          "failed to create 1 to 2 bridge for topic '%s' "
+          "with ROS 2 type '%s': %s\n",
+          topic_name.c_str(), type_name.c_str(), e.what());
+      }
+    }
+  } else {
+    fprintf(
+      stderr,
+      "The parameter '%s' either doesn't exist or isn't an array\n", topics_1_to_2_parameter_name);
   }
 
   // ROS 1 Services in ROS 2
