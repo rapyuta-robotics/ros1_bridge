@@ -405,6 +405,8 @@ This example expands on example 3 by selecting a subset of topics and services t
 This is handy when, for example, you have a system that runs most of it's stuff in either ROS 1 or ROS 2 but needs a few nodes from the 'opposite' version of ROS.
 Where the `dynamic_bridge` bridges all topics and service, the `parameter_bridge` uses the ROS 1 parameter server to choose which topics and services are bridged.
 **Note**: The service bridge is **monodirectional**. You must use either `services_2_to_1` and/or `services_1_to_2` to bridge ROS 2 -> ROS 1 or ROS 1 -> ROS 2 services accordingly.
+`topics_2_to_1` takes the same entries as `topics` but bridges ROS 2 -> ROS 1 only; `qos` applies to the ROS 2 subscriber, and a `transient_local` durability latches the ROS 1 publisher.
+`topics_1_to_2` takes the same entries as `topics` but bridges ROS 1 -> ROS 2 only; `qos` applies to the ROS 2 publisher.
 For example, to bridge only the `/chatter` topic bidirectionally, and the `/add_two_ints service` from ROS 2 to ROS 1 only, create this configuration file, `bridge.yaml`:
 
 ```yaml
